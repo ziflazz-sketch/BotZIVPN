@@ -1190,14 +1190,20 @@ async function handleServiceAction(ctx, action) {
       [{ text: 'Hapus SSH UDP', callback_data: 'del_ssh' }],      
     ];
   } 
+  const actionTitle = `Pilih jenis layanan yang ingin Anda ${action}:`;
+
   try {
-    await ctx.editMessageReplyMarkup({
-      inline_keyboard: keyboard
+    await ctx.editMessageText(actionTitle, {
+      parse_mode: 'Markdown',
+      reply_markup: {
+        inline_keyboard: keyboard
+      }
     });
     logger.info(`${action} service menu sent`);
   } catch (error) {
     if (error.response && error.response.error_code === 400) {
-      await ctx.reply(`Pilih jenis layanan yang ingin Anda ${action}:`, {
+      await ctx.reply(actionTitle, {
+        parse_mode: 'Markdown',
         reply_markup: {
           inline_keyboard: keyboard
         }
@@ -1586,23 +1592,105 @@ bot.action('service_del', async (ctx) => {
 });
 
 const { exec } = require('child_process');
+const net = require('net');
+
+function normalizeServerHost(domain = '') {
+  const raw = String(domain || '').trim();
+  if (!raw) return '';
+  try {
+    if (/^https?:\/\//i.test(raw)) {
+      return new URL(raw).hostname || raw;
+    }
+    return raw.replace(/^https?:\/\//i, '').split('/')[0].split(':')[0].trim();
+  } catch (error) {
+    return raw.replace(/^https?:\/\//i, '').split('/')[0].split(':')[0].trim();
+  }
+}
+
+function checkTcpPort(host, port, timeout = 1500) {
+  return new Promise((resolve) => {
+    if (!host) return resolve(false);
+
+    const socket = new net.Socket();
+    let settled = false;
+
+    const finalize = (result) => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      resolve(result);
+    };
+
+    socket.setTimeout(timeout);
+    socket.once('connect', () => finalize(true));
+    socket.once('timeout', () => finalize(false));
+    socket.once('error', () => finalize(false));
+
+    try {
+      socket.connect(port, host);
+    } catch (error) {
+      finalize(false);
+    }
+  });
+}
+
+async function getServerStatusSummary() {
+  const servers = await dbAllAsync('SELECT id, nama_server, domain FROM Server ORDER BY id ASC');
+
+  if (!servers.length) {
+    return '📶 *CEK SERVER*\n\nBelum ada server yang tersimpan di database.';
+  }
+
+  const checks = await Promise.all(
+    servers.map(async (server) => {
+      const host = normalizeServerHost(server.domain);
+      const [sshOpen, apiOpen] = await Promise.all([
+        checkTcpPort(host, 22),
+        checkTcpPort(host, 5888)
+      ]);
+
+      const overallOnline = sshOpen && apiOpen;
+      const serverName = server.nama_server || `Server #${server.id}`;
+      return {
+        id: server.id,
+        serverName,
+        host: host || '-',
+        sshOpen,
+        apiOpen,
+        overallOnline
+      };
+    })
+  );
+
+  const onlineCount = checks.filter((item) => item.overallOnline).length;
+  const lines = checks.map((item) => [
+    `${item.overallOnline ? '🟢' : '🔴'} *${item.serverName}*`,
+    `🌐 Host  : \`${item.host}\``,
+    `🔐 Port 22   : ${item.sshOpen ? 'ONLINE ✅' : 'OFFLINE ❌'}`,
+    `⚙️ Port 5888 : ${item.apiOpen ? 'ONLINE ✅' : 'OFFLINE ❌'}`,
+    `📡 Status    : *${item.overallOnline ? 'ONLINE' : 'OFFLINE'}*`
+  ].join('\n')).join('\n\n━━━━━━━━━━━━━━━━━━━━\n\n');
+
+  return `📶 *STATUS SERVER ZIFLAZZ*\n\n📊 Total Server : *${checks.length}*\n🟢 Online       : *${onlineCount}*\n🔴 Offline      : *${checks.length - onlineCount}*\n\n${lines}`;
+}
 
 bot.action('cek_service', async (ctx) => {
   try {
-    const message = await ctx.reply('⏳ Sedang mengecek status server...');
+    await ctx.answerCbQuery();
+    const loadingMessage = await ctx.reply('⏳ Sedang mengecek status server dari database...');
+    const summary = await getServerStatusSummary();
 
-    exec('chmod +x cek-port.sh && bash cek-port.sh', (error, stdout, stderr) => {
-      if (error) {
-        console.error(error);
-        return ctx.reply('❌ Terjadi kesalahan saat menjalankan pengecekan.');
-      }
-
-      const cleanOutput = stdout.replace(/\x1b\[[0-9;]*m/g, '');
-
-      ctx.reply(`📡 *Hasil Cek Port:*\n\n\`\`\`\n${cleanOutput}\n\`\`\``, {
-        parse_mode: 'Markdown'
-      });
-    });
+    try {
+      await ctx.telegram.editMessageText(
+        loadingMessage.chat.id,
+        loadingMessage.message_id,
+        undefined,
+        summary,
+        { parse_mode: 'Markdown' }
+      );
+    } catch (editError) {
+      await ctx.reply(summary, { parse_mode: 'Markdown' });
+    }
   } catch (err) {
     console.error(err);
     ctx.reply('❌ Gagal menjalankan pengecekan server.');
@@ -1707,7 +1795,7 @@ async function startSelectServer(ctx, action, type, page = 0) {
       if (navButtons.length) keyboard.push(navButtons);
       keyboard.push([{ text: '🔙 Kembali ke Menu Utama', callback_data: 'send_main_menu' }]);
 
-      const serverList = currentServers.map(server => {
+      const serverList = currentServers.map((server, index) => {
         const hargaPer30Hari = server.harga * 30;
         const isFull = server.total_create_akun >= server.batas_create_akun;
         const rawQuota = server.quota?.toString().trim();
@@ -1764,7 +1852,7 @@ bot.action(/(create)_username_(ssh)_(.+)/, async (ctx) => {
   state.type = type;
   state.action = action;
 
-  db.get('SELECT batas_create_akun, total_create_akun FROM Server WHERE id = ?', [serverId], async (err, server) => {
+  db.get('SELECT batas_create_akun, total_create_akun, nama_server, harga FROM Server WHERE id = ?', [serverId], async (err, server) => {
     if (err) {
       logger.error('⚠️ Error fetching server details:', err.message);
       return ctx.reply('❌ *Terjadi kesalahan saat mengambil detail server.*', { parse_mode: 'Markdown' });
@@ -1874,7 +1962,7 @@ bot.action(/(trial)_username_(ssh)_(.+)/, async (ctx) => {
     if (!isRessel) {
       const sudahPakai = await checkTrialAccess(ctx.from.id);
       if (sudahPakai) {
-        return ctx.reply('❌ *Anda sudah menggunakan fitur trial hari ini. Silakan coba lagi besok.*', { parse_mode: 'Markdown' });
+        return ctx.reply('❌ *Trial hari ini sudah digunakan.*\n\nSilakan kembali lagi besok untuk mencoba layanan trial berikutnya.', { parse_mode: 'Markdown' });
       }
       await saveTrialAccess(ctx.from.id); // simpan tanggal trial
     }
@@ -2035,7 +2123,7 @@ if (state.step?.startsWith('password_')) {
   }
 
   state.step = `exp_${state.action}_${state.type}`;
-  await ctx.reply('⏳ *Masukkan masa aktif (hari):*', { parse_mode: 'Markdown' });
+  await ctx.reply(`📅 *Masukkan masa aktif akun (hari).*\nContoh: \`30\` untuk 30 hari.`, { parse_mode: 'Markdown' });
   } else if (state.step?.startsWith('exp_')) {
     const expInput = ctx.message.text.trim();
     if (!/^\d+$/.test(expInput)) {
@@ -2168,7 +2256,7 @@ db.run('UPDATE users SET saldo = saldo - ? WHERE user_id = ?', [totalHarga, ctx.
   }
 });
 
-await ctx.reply(msg, { parse_mode: 'Markdown' });
+await ctx.reply(`✅ *CREATE SSH ZIFLAZZ BERHASIL*\n\n${msg}`, { parse_mode: 'Markdown' });
 delete userState[ctx.chat.id];
 //SALDO DATABES
           });
