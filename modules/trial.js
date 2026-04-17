@@ -2,7 +2,7 @@ const axios = require('axios');
 const { exec } = require('child_process');
 const sqlite3 = require('sqlite3').verbose();
 const db = new sqlite3.Database('./sellzivpn.db');
-async function createssh(username, password, exp, iplimit, serverId) {
+async function trialssh(username, password, exp, iplimit, serverId) {
   console.log(`Creating SSH account for ${username} with expiry ${exp} days, IP limit ${iplimit}, and password ${password}`);
 
 // Validasi username
@@ -20,7 +20,8 @@ if (!/^[a-zA-Z0-9-]+$/.test(username)) {
     const domain = server.domain;
     const AUTH_TOKEN = server.auth;
 
-    const curlCommand = `curl --fail --connect-timeout 1 --max-time 30 "http://${domain}:5888/create/zivpn?password=${password}&exp=${exp}&auth=${AUTH_TOKEN}"`;
+    // Endpoint trial
+    const curlCommand = `curl --fail --connect-timeout 1 --max-time 30 "http://${domain}:5888/trial/zivpn?exp=${exp}&auth=${AUTH_TOKEN}"`;
 
     exec(curlCommand, (err, stdout, stderr) => {
   if (err) {
@@ -54,7 +55,7 @@ if (!/^[a-zA-Z0-9-]+$/.test(username)) {
     return resolve(`❌ ${d.message || "Permintaan gagal."}`);
   }
 
-      // UPDATE total create akun
+      // UPDATE total create akun (opsional)
       if (exp >= 1 && exp <= 135) {
         db.run(
           'UPDATE Server SET total_create_akun = total_create_akun + 1 WHERE id = ?',
@@ -62,6 +63,7 @@ if (!/^[a-zA-Z0-9-]+$/.test(username)) {
         );
       }
 
+      // Pesan untuk Telegram / Bot
       const msg = `${d.message}
 
 📘 *TUTORIAL PASANG ZIVPN*
@@ -80,7 +82,7 @@ https://drive.google.com/file/d/1BAPWA4ejDsq0IcXxJt72GfjD4224iDpI/view?usp=shari
   });
 }
 
-module.exports = { createssh }; 
+module.exports = { trialssh }; 
 
 
 
