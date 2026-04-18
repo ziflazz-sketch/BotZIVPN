@@ -4,6 +4,8 @@ const express = require('express');
 const { Telegraf, Markup } = require('telegraf');
 const app = express();
 const axios = require('axios');
+const http = require('http');
+const https = require('https');
 const { isUserReseller, addReseller, removeReseller, listResellersSync } = require('./modules/reseller');
 const winston = require('winston');
 const logger = winston.createLogger({
@@ -73,7 +75,7 @@ async function checkServerAccess(serverId, userId) {
       if (!flag) return resolve({ ok: true }); // publik
       // jika reseller-only, cek apakah user terdaftar reseller
       try {
-        const isR = await isUserReseller(userId);
+        const isR = await isUserResellerCached(userId);
         if (isR) return resolve({ ok: true });
         return resolve({ ok: false, reason: 'reseller_only' });
       } catch (e) {
@@ -113,6 +115,17 @@ const GOPAY_KEY = vars.GOPAY_KEY;
 if (vars.PAYMENT === "GOPAY" && !GOPAY_KEY) {
   throw new Error('GOPAY_KEY wajib diisi untuk payment GOPAY');
 }
+
+const DEFAULT_REQUEST_TIMEOUT = 8000;
+const PAYMENT_REQUEST_TIMEOUT = 10000;
+const sharedHttpAgent = new http.Agent({ keepAlive: true, timeout: DEFAULT_REQUEST_TIMEOUT });
+const sharedHttpsAgent = new https.Agent({ keepAlive: true, timeout: PAYMENT_REQUEST_TIMEOUT });
+const paymentHttp = axios.create({
+  timeout: PAYMENT_REQUEST_TIMEOUT,
+  httpAgent: sharedHttpAgent,
+  httpsAgent: sharedHttpsAgent,
+  validateStatus: () => true
+});
 
 let TOPUP_BONUS_PERCENT = 0;
 
@@ -206,6 +219,165 @@ function dbAllAsync(sql, params = []) {
   });
 }
 
+function dbGetAsync(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.get(sql, params, (err, row) => {
+      if (err) return reject(err);
+      resolve(row || null);
+    });
+  });
+}
+
+function dbExecAsync(sql) {
+  return new Promise((resolve, reject) => {
+    db.exec(sql, (err) => {
+      if (err) return reject(err);
+      resolve();
+    });
+  });
+}
+
+const cacheStore = new Map();
+
+function getCachedValue(key) {
+  const entry = cacheStore.get(key);
+  if (!entry) return null;
+  if (entry.expiresAt <= Date.now()) {
+    cacheStore.delete(key);
+    return null;
+  }
+  return entry.value;
+}
+
+function setCachedValue(key, value, ttlMs) {
+  cacheStore.set(key, { value, expiresAt: Date.now() + ttlMs });
+  return value;
+}
+
+async function rememberAsync(key, ttlMs, producer) {
+  const cached = getCachedValue(key);
+  if (cached !== null) return cached;
+
+  const pendingKey = `${key}:pending`;
+  const pending = cacheStore.get(pendingKey);
+  if (pending?.promise) return pending.promise;
+
+  const promise = Promise.resolve()
+    .then(producer)
+    .then((value) => {
+      cacheStore.delete(pendingKey);
+      return setCachedValue(key, value, ttlMs);
+    })
+    .catch((error) => {
+      cacheStore.delete(pendingKey);
+      throw error;
+    });
+
+  cacheStore.set(pendingKey, { promise, expiresAt: Date.now() + ttlMs });
+  return promise;
+}
+
+function invalidateCache(prefix) {
+  for (const key of cacheStore.keys()) {
+    if (key === prefix || key.startsWith(prefix)) {
+      cacheStore.delete(key);
+    }
+  }
+}
+
+const MENU_STATS_TYPES = ['ssh', 'vmess', 'vless', 'trojan', 'shadowsocks'];
+const CACHE_TTL = {
+  resellerMs: 5000,
+  serverRowsMs: 5000,
+  serverNamesMs: 5000,
+  globalStatsMs: 10000,
+  userStatsMs: 10000,
+  userCountMs: 15000
+};
+
+function getTimeWindowStarts() {
+  const now = new Date();
+  return {
+    todayStart: new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime(),
+    weekStart: new Date(now.getFullYear(), now.getMonth(), now.getDate() - now.getDay()).getTime(),
+    monthStart: new Date(now.getFullYear(), now.getMonth(), 1).getTime()
+  };
+}
+
+async function getCachedResellerIds() {
+  return rememberAsync('reseller_ids', CACHE_TTL.resellerMs, async () => new Set(listResellersSync().map(String)));
+}
+
+async function isUserResellerCached(userId) {
+  const resellerIds = await getCachedResellerIds();
+  return resellerIds.has(String(userId));
+}
+
+async function getServerRowsCached() {
+  return rememberAsync('server_rows_full', CACHE_TTL.serverRowsMs, async () => (
+    dbAllAsync('SELECT id, domain, auth, harga, nama_server, quota, iplimit, batas_create_akun, total_create_akun, is_reseller_only FROM Server ORDER BY id ASC')
+  ));
+}
+
+async function getServerNameRowsCached() {
+  return rememberAsync('server_rows_names', CACHE_TTL.serverNamesMs, async () => {
+    try {
+      return await dbAllAsync('SELECT id, nama_server FROM Server ORDER BY id ASC');
+    } catch (err) {
+      logger.error('❌ Kesalahan saat mengambil daftar server: ' + err.message);
+      throw '⚠️ *PERHATIAN! Terjadi kesalahan saat mengambil daftar server.*';
+    }
+  });
+}
+
+async function getCachedUsersCount() {
+  return rememberAsync('users_count', CACHE_TTL.userCountMs, async () => {
+    const row = await dbGetAsync('SELECT COUNT(*) AS count FROM users');
+    return Number(row?.count || 0);
+  });
+}
+
+async function getUserAccountStats(userId) {
+  const { todayStart, weekStart, monthStart } = getTimeWindowStarts();
+  return rememberAsync(`user_stats:${userId}:${todayStart}`, CACHE_TTL.userStatsMs, async () => {
+    const row = await dbGetAsync(
+      `SELECT
+         SUM(CASE WHEN timestamp >= ? AND type IN (${MENU_STATS_TYPES.map(() => '?').join(',')}) THEN 1 ELSE 0 END) AS today_count,
+         SUM(CASE WHEN timestamp >= ? AND type IN (${MENU_STATS_TYPES.map(() => '?').join(',')}) THEN 1 ELSE 0 END) AS week_count,
+         SUM(CASE WHEN timestamp >= ? AND type IN (${MENU_STATS_TYPES.map(() => '?').join(',')}) THEN 1 ELSE 0 END) AS month_count
+       FROM transactions
+       WHERE user_id = ?`,
+      [todayStart, ...MENU_STATS_TYPES, weekStart, ...MENU_STATS_TYPES, monthStart, ...MENU_STATS_TYPES, userId]
+    );
+
+    return {
+      today: Number(row?.today_count || 0),
+      week: Number(row?.week_count || 0),
+      month: Number(row?.month_count || 0)
+    };
+  });
+}
+
+async function getGlobalAccountStats() {
+  const { todayStart, weekStart, monthStart } = getTimeWindowStarts();
+  return rememberAsync(`global_stats:${todayStart}`, CACHE_TTL.globalStatsMs, async () => {
+    const row = await dbGetAsync(
+      `SELECT
+         SUM(CASE WHEN timestamp >= ? AND type IN (${MENU_STATS_TYPES.map(() => '?').join(',')}) THEN 1 ELSE 0 END) AS today_count,
+         SUM(CASE WHEN timestamp >= ? AND type IN (${MENU_STATS_TYPES.map(() => '?').join(',')}) THEN 1 ELSE 0 END) AS week_count,
+         SUM(CASE WHEN timestamp >= ? AND type IN (${MENU_STATS_TYPES.map(() => '?').join(',')}) THEN 1 ELSE 0 END) AS month_count
+       FROM transactions`,
+      [todayStart, ...MENU_STATS_TYPES, weekStart, ...MENU_STATS_TYPES, monthStart, ...MENU_STATS_TYPES]
+    );
+
+    return {
+      today: Number(row?.today_count || 0),
+      week: Number(row?.week_count || 0),
+      month: Number(row?.month_count || 0)
+    };
+  });
+}
+
 async function ensureColumnExists(tableName, columnName, columnDefinition) {
   const columns = await dbAllAsync(`PRAGMA table_info(${tableName})`);
   if (columns.some((column) => column.name === columnName)) return false;
@@ -214,7 +386,58 @@ async function ensureColumnExists(tableName, columnName, columnDefinition) {
   return true;
 }
 
+async function optimizeDatabase() {
+  await dbExecAsync(`
+    PRAGMA journal_mode = WAL;
+    PRAGMA synchronous = NORMAL;
+    PRAGMA temp_store = MEMORY;
+    PRAGMA busy_timeout = 5000;
+    PRAGMA foreign_keys = ON;
+  `);
+
+  await dbRun('CREATE INDEX IF NOT EXISTS idx_pending_deposits_status ON pending_deposits(status)');
+  await dbRun('CREATE INDEX IF NOT EXISTS idx_pending_deposits_user_status ON pending_deposits(user_id, status)');
+  await dbRun('CREATE INDEX IF NOT EXISTS idx_transactions_reference_amount ON transactions(reference_id, amount)');
+  await dbRun('CREATE INDEX IF NOT EXISTS idx_transactions_user_timestamp ON transactions(user_id, timestamp)');
+  await dbRun('CREATE INDEX IF NOT EXISTS idx_transactions_type_timestamp ON transactions(type, timestamp)');
+  await dbRun('CREATE INDEX IF NOT EXISTS idx_server_name ON Server(nama_server)');
+}
+
 async function initializeDatabase() {
+  await dbRun(`CREATE TABLE IF NOT EXISTS Server (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    domain TEXT,
+    auth TEXT,
+    harga INTEGER,
+    nama_server TEXT,
+    quota INTEGER,
+    iplimit INTEGER,
+    batas_create_akun INTEGER,
+    total_create_akun INTEGER,
+    is_reseller_only INTEGER DEFAULT 0
+  )`);
+
+  await ensureColumnExists('Server', 'is_reseller_only', 'is_reseller_only INTEGER DEFAULT 0').catch(() => false);
+
+  await dbRun(`CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER UNIQUE,
+    saldo INTEGER DEFAULT 0,
+    CONSTRAINT unique_user_id UNIQUE (user_id)
+  )`);
+
+  await dbRun(`CREATE TABLE IF NOT EXISTS transactions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    amount INTEGER,
+    type TEXT,
+    reference_id TEXT,
+    timestamp INTEGER,
+    FOREIGN KEY (user_id) REFERENCES users(user_id)
+  )`);
+
+  await ensureColumnExists('transactions', 'reference_id', 'reference_id TEXT').catch(() => false);
+
   await dbRun(`CREATE TABLE IF NOT EXISTS pending_deposits (
     unique_code TEXT PRIMARY KEY,
     user_id INTEGER,
@@ -235,6 +458,8 @@ async function initializeDatabase() {
   )`);
 
   await dbRun(`INSERT OR IGNORE INTO app_settings (key, value) VALUES ('topup_bonus_percent', '0')`);
+
+  await optimizeDatabase();
 
   const bonusValue = await loadTopupBonusPercent();
   logger.info(`Bonus topup aktif: ${bonusValue}%`);
@@ -381,64 +606,36 @@ bot.command('admin', async (ctx) => {
   await sendAdminMenu(ctx);
 });
 async function sendMainMenu(ctx) {
-  // Ambil data user
+  const startedAt = process.hrtime.bigint();
   const userId = ctx.from.id;
   const userName = ctx.from.first_name || '-';
+
   let saldo = 0;
-  try {
-    const row = await new Promise((resolve, reject) => {
-      db.get('SELECT saldo FROM users WHERE user_id = ?', [userId], (err, row) => {
-        if (err) reject(err); else resolve(row);
-      });
-    });
-    saldo = row ? row.saldo : 0;
-  } catch (e) { saldo = 0; }
-
-  // Statistik user
-  const now = new Date();
-  const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
-  const weekStart = new Date(now.getFullYear(), now.getMonth(), now.getDate() - now.getDay()).getTime();
-  const monthStart = new Date(now.getFullYear(), now.getMonth(), 1).getTime();
-  let userToday = 0, userWeek = 0, userMonth = 0;
-  let globalToday = 0, globalWeek = 0, globalMonth = 0;
-  try {
-    userToday = await new Promise((resolve) => {
-      db.get('SELECT COUNT(*) as count FROM transactions WHERE user_id = ? AND timestamp >= ? AND type IN ("ssh","vmess","vless","trojan","shadowsocks")', [userId, todayStart], (err, row) => resolve(row ? row.count : 0));
-    });
-    userWeek = await new Promise((resolve) => {
-      db.get('SELECT COUNT(*) as count FROM transactions WHERE user_id = ? AND timestamp >= ? AND type IN ("ssh","vmess","vless","trojan","shadowsocks")', [userId, weekStart], (err, row) => resolve(row ? row.count : 0));
-    });
-    userMonth = await new Promise((resolve) => {
-      db.get('SELECT COUNT(*) as count FROM transactions WHERE user_id = ? AND timestamp >= ? AND type IN ("ssh","vmess","vless","trojan","shadowsocks")', [userId, monthStart], (err, row) => resolve(row ? row.count : 0));
-    });
-    globalToday = await new Promise((resolve) => {
-      db.get('SELECT COUNT(*) as count FROM transactions WHERE timestamp >= ? AND type IN ("ssh","vmess","vless","trojan","shadowsocks")', [todayStart], (err, row) => resolve(row ? row.count : 0));
-    });
-    globalWeek = await new Promise((resolve) => {
-      db.get('SELECT COUNT(*) as count FROM transactions WHERE timestamp >= ? AND type IN ("ssh","vmess","vless","trojan","shadowsocks")', [weekStart], (err, row) => resolve(row ? row.count : 0));
-    });
-    globalMonth = await new Promise((resolve) => {
-      db.get('SELECT COUNT(*) as count FROM transactions WHERE timestamp >= ? AND type IN ("ssh","vmess","vless","trojan","shadowsocks")', [monthStart], (err, row) => resolve(row ? row.count : 0));
-    });
-  } catch (e) {}
-
-  // Jumlah pengguna bot
+  let userStats = { today: 0, week: 0, month: 0 };
+  let globalStats = { today: 0, week: 0, month: 0 };
   let jumlahPengguna = 0;
   let isReseller = false;
-if (fs.existsSync(resselFilePath)) {
-  const resellerList = fs.readFileSync(resselFilePath, 'utf8').split('\n').map(x => x.trim());
-  isReseller = resellerList.includes(userId.toString());
-}
-const statusReseller = isReseller ? 'Reseller' : 'Bukan Reseller';
-  try {
-    const row = await new Promise((resolve, reject) => {
-      db.get('SELECT COUNT(*) AS count FROM users', (err, row) => { if (err) reject(err); else resolve(row); });
-    });
-    jumlahPengguna = row.count;
-  } catch (e) { jumlahPengguna = 0; }
 
-  // Latency (dummy, bisa diubah sesuai kebutuhan)
-  const latency = (Math.random() * 0.1 + 0.01).toFixed(2);
+  try {
+    const [saldoRow, userStatsData, globalStatsData, userCountData, resellerStatus] = await Promise.all([
+      dbGetAsync('SELECT saldo FROM users WHERE user_id = ?', [userId]).catch(() => null),
+      getUserAccountStats(userId).catch(() => ({ today: 0, week: 0, month: 0 })),
+      getGlobalAccountStats().catch(() => ({ today: 0, week: 0, month: 0 })),
+      getCachedUsersCount().catch(() => 0),
+      isUserResellerCached(userId).catch(() => false)
+    ]);
+
+    saldo = Number(saldoRow?.saldo || 0);
+    userStats = userStatsData;
+    globalStats = globalStatsData;
+    jumlahPengguna = Number(userCountData || 0);
+    isReseller = Boolean(resellerStatus);
+  } catch (error) {
+    logger.error('Gagal memuat data menu utama: ' + (error?.message || error));
+  }
+
+  const statusReseller = isReseller ? 'Reseller' : 'Bukan Reseller';
+  const latency = Number(process.hrtime.bigint() - startedAt) / 1e6;
 
   const messageText = `
 ╭─ <b>⚡ BOT ZIVPN UDP ${NAMA_STORE} ⚡</b>
@@ -452,14 +649,14 @@ Saldo: <code>Rp ${saldo}</code>
 Status: <code>${statusReseller}</code>
 
 <blockquote>📊 <b>Statistik Anda</b>
-• Hari Ini    : ${userToday} akun
-• Minggu Ini  : ${userWeek} akun
-• Bulan Ini   : ${userMonth} akun
+• Hari Ini    : ${userStats.today} akun
+• Minggu Ini  : ${userStats.week} akun
+• Bulan Ini   : ${userStats.month} akun
 
 🌐 <b>Statistik Global</b>
-• Hari Ini    : ${globalToday} akun
-• Minggu Ini  : ${globalWeek} akun
-• Bulan Ini   : ${globalMonth} akun
+• Hari Ini    : ${globalStats.today} akun
+• Minggu Ini  : ${globalStats.week} akun
+• Bulan Ini   : ${globalStats.month} akun
 </blockquote>
 
 ⚙️ <b>COMMAND</b>
@@ -471,11 +668,10 @@ Status: <code>${statusReseller}</code>
 🛠️ <b>Credit:</b> ZIFLAZZ
 🔧 <b>Base:</b> ZIFLAZZ
 👥 <b>Pengguna BOT:</b> ${jumlahPengguna}
-⏱️ <b>Latency:</b> ${latency} ms
+⏱️ <b>Latency:</b> ${latency.toFixed(2)} ms
 ──────────────────────────`;
 
-let keyboard;
-  keyboard = [
+  const keyboard = [
     [
       { text: '➕ Buat Akun', callback_data: 'service_create' },
       { text: '♻️ Perpanjang Akun', callback_data: 'service_renew' }
@@ -485,45 +681,41 @@ let keyboard;
       { text: '📶 Cek Server', callback_data: 'cek_service' }
     ],
     [
-     { text: '⌛ Trial Akun', callback_data: 'service_trial' },
+      { text: '⌛ Trial Akun', callback_data: 'service_trial' },
       { text: '💰 TopUp Saldo', callback_data: 'topup_saldo' }
     ],
     [
       { text: '🤝 Jadi Reseller & Dapat Harga Spesial', callback_data: 'jadi_reseller' }
     ]
   ];
+
   try {
     if (ctx.updateType === 'callback_query') {
       try {
-      await ctx.editMessageText(messageText, {
+        await ctx.editMessageText(messageText, {
           parse_mode: 'HTML',
           reply_markup: { inline_keyboard: keyboard }
         });
       } catch (error) {
-        // Jika error karena message sudah diedit/dihapus, abaikan
         if (error && error.response && error.response.error_code === 400 &&
             (error.response.description.includes('message is not modified') ||
              error.response.description.includes('message to edit not found') ||
-             error.response.description.includes('message can\'t be edited'))
+             error.response.description.includes("message can't be edited"))
         ) {
           logger.info('Edit message diabaikan karena pesan sudah diedit/dihapus atau tidak berubah.');
-    } else {
-          logger.error('Error saat mengedit menu utama:', error);
+        } else {
+          logger.error('Error saat mengedit menu utama: ' + (error?.message || error));
         }
       }
     } else {
-      try {
-        await ctx.reply(messageText, {
-          parse_mode: 'HTML',
-          reply_markup: { inline_keyboard: keyboard }
-        });
-      } catch (error) {
-        logger.error('Error saat mengirim menu utama:', error);
-      }
+      await ctx.reply(messageText, {
+        parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: keyboard }
+      });
     }
     logger.info('Main menu sent');
   } catch (error) {
-    logger.error('Error umum saat mengirim menu utama:', error);
+    logger.error('Error umum saat mengirim menu utama: ' + (error?.message || error));
   }
 }
 
@@ -1635,7 +1827,7 @@ function checkTcpPort(host, port, timeout = 1500) {
 }
 
 async function getServerStatusSummary() {
-  const servers = await dbAllAsync('SELECT id, nama_server, domain FROM Server ORDER BY id ASC');
+  const servers = await getServerRowsCached();
 
   if (!servers.length) {
     return '📶 *CEK SERVER*\n\nBelum ada server yang tersimpan di database.';
@@ -1737,98 +1929,89 @@ bot.action('renew_ssh', async (ctx) => {
 
 async function startSelectServer(ctx, action, type, page = 0) {
   try {
-    const isR = await isUserReseller(ctx.from.id);
-    const query = 'SELECT * FROM Server';
+    const [isR, servers] = await Promise.all([
+      isUserResellerCached(ctx.from.id),
+      getServerRowsCached()
+    ]);
 
-    db.all(query, [], (err, servers) => {
-      if (err) {
-        logger.error('⚠️ Error fetching servers:', err.message);
-        return ctx.reply('⚠️ Tidak ada server yang tersedia saat ini.', { parse_mode: 'HTML' });
-      }
+    if (!servers.length) {
+      return ctx.reply('⚠️ Tidak ada server yang tersedia saat ini.', { parse_mode: 'HTML' });
+    }
 
-      // ==== FILTER RESSELLER-ONLY ====
-      let filteredServers = servers.filter(server => {
-        const isResellerOnly = Number(server.is_reseller_only) === 1;
-
-        // Jika server hanya untuk reseller
-        if (isResellerOnly && !isR) return false;
-
-        // Jika server publik dan user adalah reseller (opsional)
-        if (!isResellerOnly && isR) return false;
-
-        return true;
-      });
-
-      // ==== SORT SERVER TERSEDIA DI DEPAN, PENUH DI BELAKANG ====
-      filteredServers.sort((a, b) => {
-        const aFull = a.total_create_akun >= a.batas_create_akun ? 1 : 0;
-        const bFull = b.total_create_akun >= b.batas_create_akun ? 1 : 0;
-        if (aFull !== bFull) return aFull - bFull; // server penuh terakhir
-        return a.nama_server.localeCompare(b.nama_server); // urut alfabet kalau status sama
-      });
-
-      logger.info(`User ${ctx.from.id} melihat ${filteredServers.length} server dari ${servers.length} total`);
-
-      // ==== Pagination & render ====
-      const serversPerPage = 10;
-      const totalPages = Math.ceil(filteredServers.length / serversPerPage);
-      const currentPage = Math.min(Math.max(page, 0), totalPages - 1);
-      const start = currentPage * serversPerPage;
-      const end = start + serversPerPage;
-      const currentServers = filteredServers.slice(start, end);
-
-      const keyboard = [];
-      for (let i = 0; i < currentServers.length; i += 2) {
-        const row = [];
-        row.push({ text: currentServers[i].nama_server, callback_data: `${action}_username_${type}_${currentServers[i].id}` });
-        if (currentServers[i + 1]) {
-          row.push({ text: currentServers[i + 1].nama_server, callback_data: `${action}_username_${type}_${currentServers[i + 1].id}` });
-        }
-        keyboard.push(row);
-      }
-
-      const navButtons = [];
-      if (totalPages > 1) {
-        if (currentPage > 0) navButtons.push({ text: '⬅️ Back', callback_data: `navigate_${action}_${type}_${currentPage - 1}` });
-        if (currentPage < totalPages - 1) navButtons.push({ text: '➡️ Next', callback_data: `navigate_${action}_${type}_${currentPage + 1}` });
-      }
-      if (navButtons.length) keyboard.push(navButtons);
-      keyboard.push([{ text: '🔙 Kembali ke Menu Utama', callback_data: 'send_main_menu' }]);
-
-      const serverList = currentServers.map((server, index) => {
-        const hargaPer30Hari = server.harga * 30;
-        const isFull = server.total_create_akun >= server.batas_create_akun;
-        const rawQuota = server.quota?.toString().trim();
-        const showQuota =
-          !rawQuota || rawQuota === "0" || rawQuota === ")"
-            ? "Unlimited"
-            : `${rawQuota}GB`;
-
-        return `🌐 *${server.nama_server}*\n` +
-               `💰 Harga per hari: Rp${server.harga}\n` +
-               `📅 Harga per 30 hari: Rp${hargaPer30Hari}\n` +
-               `📊 Quota: ${showQuota}\n` +
-               `🔢 Limit IP: ${server.iplimit} IP\n` +
-               (isFull ? `⚠️ *Server Penuh*` : `👥 Total Create Akun: ${server.total_create_akun}/${server.batas_create_akun}`);
-      }).join('\n\n');
-
-      if (ctx.updateType === 'callback_query') {
-        ctx.editMessageText(`📋 *List Server (Halaman ${currentPage + 1} dari ${totalPages})*\n\n${serverList}`, {
-          reply_markup: { inline_keyboard: keyboard },
-          parse_mode: 'Markdown'
-        });
-      } else {
-        ctx.reply(`📋 *List Server (Halaman ${currentPage + 1} dari ${totalPages})*\n\n${serverList}`, {
-          reply_markup: { inline_keyboard: keyboard },
-          parse_mode: 'Markdown'
-        });
-      }
-
-      userState[ctx.chat.id] = { step: `${action}_username_${type}`, page: currentPage };
+    let filteredServers = servers.filter((server) => {
+      const isResellerOnly = Number(server.is_reseller_only) === 1;
+      if (isResellerOnly && !isR) return false;
+      if (!isResellerOnly && isR) return false;
+      return true;
     });
 
+    filteredServers.sort((a, b) => {
+      const aFull = Number(a.total_create_akun) >= Number(a.batas_create_akun) ? 1 : 0;
+      const bFull = Number(b.total_create_akun) >= Number(b.batas_create_akun) ? 1 : 0;
+      if (aFull !== bFull) return aFull - bFull;
+      return String(a.nama_server || '').localeCompare(String(b.nama_server || ''));
+    });
+
+    logger.info(`User ${ctx.from.id} melihat ${filteredServers.length} server dari ${servers.length} total`);
+
+    if (!filteredServers.length) {
+      return ctx.reply('⚠️ Tidak ada server yang cocok untuk akun Anda saat ini.', { parse_mode: 'Markdown' });
+    }
+
+    const serversPerPage = 10;
+    const totalPages = Math.max(1, Math.ceil(filteredServers.length / serversPerPage));
+    const currentPage = Math.min(Math.max(page, 0), totalPages - 1);
+    const start = currentPage * serversPerPage;
+    const currentServers = filteredServers.slice(start, start + serversPerPage);
+
+    const keyboard = [];
+    for (let i = 0; i < currentServers.length; i += 2) {
+      const row = [{ text: currentServers[i].nama_server, callback_data: `${action}_username_${type}_${currentServers[i].id}` }];
+      if (currentServers[i + 1]) {
+        row.push({ text: currentServers[i + 1].nama_server, callback_data: `${action}_username_${type}_${currentServers[i + 1].id}` });
+      }
+      keyboard.push(row);
+    }
+
+    const navButtons = [];
+    if (totalPages > 1) {
+      if (currentPage > 0) navButtons.push({ text: '⬅️ Back', callback_data: `navigate_${action}_${type}_${currentPage - 1}` });
+      if (currentPage < totalPages - 1) navButtons.push({ text: '➡️ Next', callback_data: `navigate_${action}_${type}_${currentPage + 1}` });
+    }
+    if (navButtons.length) keyboard.push(navButtons);
+    keyboard.push([{ text: '🔙 Kembali ke Menu Utama', callback_data: 'send_main_menu' }]);
+
+    const serverList = currentServers.map((server) => {
+      const hargaPer30Hari = Number(server.harga || 0) * 30;
+      const isFull = Number(server.total_create_akun) >= Number(server.batas_create_akun);
+      const rawQuota = String(server.quota ?? '').trim();
+      const showQuota = !rawQuota || rawQuota === '0' || rawQuota === ')' ? 'Unlimited' : `${rawQuota}GB`;
+
+      return `🌐 *${server.nama_server}*\n` +
+             `💰 Harga per hari: Rp${server.harga}\n` +
+             `📅 Harga per 30 hari: Rp${hargaPer30Hari}\n` +
+             `📊 Quota: ${showQuota}\n` +
+             `🔢 Limit IP: ${server.iplimit} IP\n` +
+             (isFull ? `⚠️ *Server Penuh*` : `👥 Total Create Akun: ${server.total_create_akun}/${server.batas_create_akun}`);
+    }).join('\n\n');
+
+    const message = `📋 *List Server (Halaman ${currentPage + 1} dari ${totalPages})*\n\n${serverList}`;
+
+    if (ctx.updateType === 'callback_query') {
+      await ctx.editMessageText(message, {
+        reply_markup: { inline_keyboard: keyboard },
+        parse_mode: 'Markdown'
+      });
+    } else {
+      await ctx.reply(message, {
+        reply_markup: { inline_keyboard: keyboard },
+        parse_mode: 'Markdown'
+      });
+    }
+
+    userState[ctx.chat.id] = { step: `${action}_username_${type}`, page: currentPage };
   } catch (error) {
-    logger.error(`❌ Error saat memulai proses ${action} untuk ${type}:`, error);
+    logger.error(`❌ Error saat memulai proses ${action} untuk ${type}: ${error?.message || error}`);
     await ctx.reply(`❌ *GAGAL!* Terjadi kesalahan saat memproses permintaan.`, { parse_mode: 'Markdown' });
   }
 }
@@ -2145,7 +2328,7 @@ if (exp > 365) {
 }
     state.exp = exp;
 
-    db.get('SELECT quota, iplimit FROM Server WHERE id = ?', [state.serverId], async (err, server) => {
+    db.get('SELECT quota, iplimit, harga FROM Server WHERE id = ?', [state.serverId], async (err, server) => {
       if (err) {
         logger.error('⚠️ Error fetching server details:', err.message);
         return ctx.reply('❌ *Terjadi kesalahan saat mengambil detail server.*', { parse_mode: 'Markdown' });
@@ -2161,19 +2344,9 @@ if (exp > 365) {
       const { username, password, exp, quota, iplimit, serverId, type, action } = state;
       let msg;
 
-      db.get('SELECT harga FROM Server WHERE id = ?', [serverId], async (err, server) => {
-        if (err) {
-          logger.error('⚠️ Error fetching server price:', err.message);
-          return ctx.reply('❌ *Terjadi kesalahan saat mengambil harga server.*', { parse_mode: 'Markdown' });
-        }
-
-        if (!server) {
-          return ctx.reply('❌ *Server tidak ditemukan.*', { parse_mode: 'Markdown' });
-        }
-
-        const harga = server.harga;
-        const totalHarga = harga * state.exp; 
-        db.get('SELECT saldo FROM users WHERE user_id = ?', [ctx.from.id], async (err, user) => {
+      const harga = server.harga;
+      const totalHarga = harga * state.exp; 
+      db.get('SELECT saldo FROM users WHERE user_id = ?', [ctx.from.id], async (err, user) => {
           if (err) {
             logger.error('⚠️ Kesalahan saat mengambil saldo pengguna:', err.message);
             return ctx.reply('❌ *Terjadi kesalahan saat mengambil saldo pengguna.*', { parse_mode: 'Markdown' });
@@ -2261,7 +2434,6 @@ delete userState[ctx.chat.id];
 //SALDO DATABES
           });
         });
-      });
     } 
   else if (state.step === 'addserver') {
     const domain = ctx.message.text.trim();
@@ -2891,15 +3063,7 @@ bot.action('editserver_limit_ip', async (ctx) => {
     logger.info('Edit server limit IP process started');
     await ctx.answerCbQuery();
 
-    const servers = await new Promise((resolve, reject) => {
-      db.all('SELECT id, nama_server FROM Server', [], (err, servers) => {
-        if (err) {
-          logger.error('❌ Kesalahan saat mengambil daftar server:', err.message);
-          return reject('⚠️ *PERHATIAN! Terjadi kesalahan saat mengambil daftar server.*');
-        }
-        resolve(servers);
-      });
-    });
+    const servers = await getServerNameRowsCached();
 
     if (servers.length === 0) {
       return ctx.reply('⚠️ *PERHATIAN! Tidak ada server yang tersedia untuk diedit.*', { parse_mode: 'Markdown' });
@@ -2929,15 +3093,7 @@ bot.action('editserver_batas_create_akun', async (ctx) => {
     logger.info('Edit server batas create akun process started');
     await ctx.answerCbQuery();
 
-    const servers = await new Promise((resolve, reject) => {
-      db.all('SELECT id, nama_server FROM Server', [], (err, servers) => {
-        if (err) {
-          logger.error('❌ Kesalahan saat mengambil daftar server:', err.message);
-          return reject('⚠️ *PERHATIAN! Terjadi kesalahan saat mengambil daftar server.*');
-        }
-        resolve(servers);
-      });
-    });
+    const servers = await getServerNameRowsCached();
 
     if (servers.length === 0) {
       return ctx.reply('⚠️ *PERHATIAN! Tidak ada server yang tersedia untuk diedit.*', { parse_mode: 'Markdown' });
@@ -2967,15 +3123,7 @@ bot.action('editserver_total_create_akun', async (ctx) => {
     logger.info('Edit server total create akun process started');
     await ctx.answerCbQuery();
 
-    const servers = await new Promise((resolve, reject) => {
-      db.all('SELECT id, nama_server FROM Server', [], (err, servers) => {
-        if (err) {
-          logger.error('❌ Kesalahan saat mengambil daftar server:', err.message);
-          return reject('⚠️ *PERHATIAN! Terjadi kesalahan saat mengambil daftar server.*');
-        }
-        resolve(servers);
-      });
-    });
+    const servers = await getServerNameRowsCached();
 
     if (servers.length === 0) {
       return ctx.reply('⚠️ *PERHATIAN! Tidak ada server yang tersedia untuk diedit.*', { parse_mode: 'Markdown' });
@@ -3005,15 +3153,7 @@ bot.action('editserver_quota', async (ctx) => {
     logger.info('Edit server quota process started');
     await ctx.answerCbQuery();
 
-    const servers = await new Promise((resolve, reject) => {
-      db.all('SELECT id, nama_server FROM Server', [], (err, servers) => {
-        if (err) {
-          logger.error('❌ Kesalahan saat mengambil daftar server:', err.message);
-          return reject('⚠️ *PERHATIAN! Terjadi kesalahan saat mengambil daftar server.*');
-        }
-        resolve(servers);
-      });
-    });
+    const servers = await getServerNameRowsCached();
 
     if (servers.length === 0) {
       return ctx.reply('⚠️ *PERHATIAN! Tidak ada server yang tersedia untuk diedit.*', { parse_mode: 'Markdown' });
@@ -3043,15 +3183,7 @@ bot.action('editserver_auth', async (ctx) => {
     logger.info('Edit server auth process started');
     await ctx.answerCbQuery();
 
-    const servers = await new Promise((resolve, reject) => {
-      db.all('SELECT id, nama_server FROM Server', [], (err, servers) => {
-        if (err) {
-          logger.error('❌ Kesalahan saat mengambil daftar server:', err.message);
-          return reject('⚠️ *PERHATIAN! Terjadi kesalahan saat mengambil daftar server.*');
-        }
-        resolve(servers);
-      });
-    });
+    const servers = await getServerNameRowsCached();
 
     if (servers.length === 0) {
       return ctx.reply('⚠️ *PERHATIAN! Tidak ada server yang tersedia untuk diedit.*', { parse_mode: 'Markdown' });
@@ -3082,15 +3214,7 @@ bot.action('editserver_harga', async (ctx) => {
     logger.info('Edit server harga process started');
     await ctx.answerCbQuery();
 
-    const servers = await new Promise((resolve, reject) => {
-      db.all('SELECT id, nama_server FROM Server', [], (err, servers) => {
-        if (err) {
-          logger.error('❌ Kesalahan saat mengambil daftar server:', err.message);
-          return reject('⚠️ *PERHATIAN! Terjadi kesalahan saat mengambil daftar server.*');
-        }
-        resolve(servers);
-      });
-    });
+    const servers = await getServerNameRowsCached();
 
     if (servers.length === 0) {
       return ctx.reply('⚠️ *PERHATIAN! Tidak ada server yang tersedia untuk diedit.*', { parse_mode: 'Markdown' });
@@ -3121,15 +3245,7 @@ bot.action('editserver_domain', async (ctx) => {
     logger.info('Edit server domain process started');
     await ctx.answerCbQuery();
 
-    const servers = await new Promise((resolve, reject) => {
-      db.all('SELECT id, nama_server FROM Server', [], (err, servers) => {
-        if (err) {
-          logger.error('❌ Kesalahan saat mengambil daftar server:', err.message);
-          return reject('⚠️ *PERHATIAN! Terjadi kesalahan saat mengambil daftar server.*');
-        }
-        resolve(servers);
-      });
-    });
+    const servers = await getServerNameRowsCached();
 
     if (servers.length === 0) {
       return ctx.reply('⚠️ *PERHATIAN! Tidak ada server yang tersedia untuk diedit.*', { parse_mode: 'Markdown' });
@@ -3160,15 +3276,7 @@ bot.action('nama_server_edit', async (ctx) => {
     logger.info('Edit server nama process started');
     await ctx.answerCbQuery();
 
-    const servers = await new Promise((resolve, reject) => {
-      db.all('SELECT id, nama_server FROM Server', [], (err, servers) => {
-        if (err) {
-          logger.error('❌ Kesalahan saat mengambil daftar server:', err.message);
-          return reject('⚠️ *PERHATIAN! Terjadi kesalahan saat mengambil daftar server.*');
-        }
-        resolve(servers);
-      });
-    });
+    const servers = await getServerNameRowsCached();
 
     if (servers.length === 0) {
       return ctx.reply('⚠️ *PERHATIAN! Tidak ada server yang tersedia untuk diedit.*', { parse_mode: 'Markdown' });
@@ -3686,6 +3794,7 @@ async function updateUserSaldo(userId, saldo) {
         logger.error('⚠️ Kesalahan saat menambahkan saldo user:', err.message);
         reject(err);
       } else {
+        invalidateCache('server_');
         resolve();
       }
     });
@@ -3714,6 +3823,7 @@ global.depositState = {};
 global.pendingDeposits = {};
 let lastRequestTime = 0;
 const requestInterval = 1000; 
+let isCheckingQRISStatus = false;
 
 async function loadPendingDepositsFromDb() {
   try {
@@ -3732,7 +3842,7 @@ async function loadPendingDepositsFromDb() {
         bonusAmount: Number(row.bonus_amount || 0)
       };
     });
-    logger.info('Pending deposit loaded:', Object.keys(global.pendingDeposits).length);
+    logger.info(`Pending deposit loaded: ${Object.keys(global.pendingDeposits).length}`);
   } catch (err) {
     logger.error('Gagal load pending_deposits:', err.message);
   }
@@ -3797,20 +3907,19 @@ async function processDeposit(ctx, amount) {
     const bonusPercent = getTopupBonusPercent();
     const bonusAmount = getTopupBonusAmount(finalAmount, bonusPercent);
 
-    const res = await axios.post(
+    const res = await paymentHttp.post(
       "https://api-gopay.sawargipay.cloud/qris/generate",
       { amount: finalAmount },
       {
         headers: {
           "Content-Type": "application/json",
           "Authorization": `Bearer ${GOPAY_KEY}`
-        },
-        timeout: 15000
+        }
       }
     );
 
-    if (!res.data?.success) {
-      throw new Error("Gagal create QRIS GOPAY");
+    if (res.status >= 400 || !res.data?.success) {
+      throw new Error(res.data?.message || "Gagal create QRIS GOPAY");
     }
 
     const data = res.data.data;
@@ -3872,7 +3981,7 @@ async function processDeposit(ctx, amount) {
       transactionId
     };
 
-    db.run(
+    await dbRun(
       `INSERT INTO pending_deposits 
       (unique_code, user_id, amount, original_amount, timestamp, status, qr_message_id, transaction_id, bonus_percent, bonus_amount)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -3895,7 +4004,7 @@ async function processDeposit(ctx, amount) {
     try { await ctx.deleteMessage(); } catch {}
 
   } catch (error) {
-    console.error("❌ Deposit error:", error.message);
+    logger.error(`❌ Deposit error: ${error.message}`);
 
     await ctx.reply(
       '❌ Gagal membuat QRIS, coba lagi nanti.\n⚠️ Detail: ' + error.message,
@@ -3907,64 +4016,71 @@ async function processDeposit(ctx, amount) {
 }
 
 async function checkQRISStatus() {
+  if (isCheckingQRISStatus) return;
   if (!global.pendingDeposits || Object.keys(global.pendingDeposits).length === 0) return;
 
+  isCheckingQRISStatus = true;
   const now = Date.now();
 
-  for (const [uniqueCode, deposit] of Object.entries(global.pendingDeposits)) {
-    if (deposit.status !== 'pending') continue;
+  try {
+    for (const [uniqueCode, deposit] of Object.entries(global.pendingDeposits)) {
+      if (deposit.status !== 'pending') continue;
 
-    try {
-      // EXPIRATION
-      const maxAge = 15 * 60 * 1000;
-      if (now - deposit.timestamp > maxAge) {
-        logger.warn(`EXPIRED ${uniqueCode}`);
-        delete global.pendingDeposits[uniqueCode];
-        db.run('DELETE FROM pending_deposits WHERE unique_code = ?', [uniqueCode]);
-        continue;
-      }
-
-      if (vars.PAYMENT !== "GOPAY") {
-        logger.warn(`[QRIS] PAYMENT tidak didukung untuk ${uniqueCode}: ${vars.PAYMENT}`);
-        continue;
-      }
-
-      if (!deposit.transactionId) {
-        logger.warn(`[QRIS] transaction_id kosong untuk ${uniqueCode}, pending deposit dilewati sampai data diperbaiki.`);
-        continue;
-      }
-
-      // Cek status via API GoPay
-      const res = await axios.post(
-        "https://api-gopay.sawargipay.cloud/qris/status",
-        { transaction_id: deposit.transactionId },
-        {
-          headers: {
-            "Content-Type": "application/json",
-            "Authorization": `Bearer ${GOPAY_KEY}`
-          },
-          timeout: 15000
+      try {
+        const maxAge = 15 * 60 * 1000;
+        if (now - deposit.timestamp > maxAge) {
+          logger.warn(`EXPIRED ${uniqueCode}`);
+          delete global.pendingDeposits[uniqueCode];
+          await dbRun('DELETE FROM pending_deposits WHERE unique_code = ?', [uniqueCode]).catch(() => {});
+          continue;
         }
-      );
 
-      const data = res.data?.data;
-      if (!data) continue;
+        if (vars.PAYMENT !== "GOPAY") {
+          logger.warn(`[QRIS] PAYMENT tidak didukung untuk ${uniqueCode}: ${vars.PAYMENT}`);
+          continue;
+        }
 
-      const status = data.transaction_status;
-      logger.info(`🔍 ${uniqueCode} | ${status}`);
-      if (status !== "settlement") continue;
+        if (!deposit.transactionId) {
+          logger.warn(`[QRIS] transaction_id kosong untuk ${uniqueCode}, pending deposit dilewati sampai data diperbaiki.`);
+          continue;
+        }
 
-      logger.info(`💰 PEMBAYARAN MASUK ${uniqueCode}`);
-      const success = await processMatchingPayment(deposit, data, uniqueCode);
+        const res = await paymentHttp.post(
+          "https://api-gopay.sawargipay.cloud/qris/status",
+          { transaction_id: deposit.transactionId },
+          {
+            headers: {
+              "Content-Type": "application/json",
+              "Authorization": `Bearer ${GOPAY_KEY}`
+            }
+          }
+        );
 
-      if (success) {
-        delete global.pendingDeposits[uniqueCode];
-        db.run('DELETE FROM pending_deposits WHERE unique_code = ?', [uniqueCode]);
+        if (res.status >= 400) {
+          logger.warn(`[QRIS] STATUS HTTP ${res.status} untuk ${uniqueCode}`);
+          continue;
+        }
+
+        const data = res.data?.data;
+        if (!data) continue;
+
+        const status = data.transaction_status;
+        logger.info(`🔍 ${uniqueCode} | ${status}`);
+        if (status !== "settlement") continue;
+
+        logger.info(`💰 PEMBAYARAN MASUK ${uniqueCode}`);
+        const success = await processMatchingPayment(deposit, data, uniqueCode);
+
+        if (success) {
+          delete global.pendingDeposits[uniqueCode];
+          await dbRun('DELETE FROM pending_deposits WHERE unique_code = ?', [uniqueCode]).catch(() => {});
+        }
+      } catch (err) {
+        logger.error(`[QRIS] ERROR ${uniqueCode}: ${err.message}`);
       }
-
-    } catch (err) {
-      logger.error(`[QRIS] ERROR ${uniqueCode}: ${err.message}`);
     }
+  } finally {
+    isCheckingQRISStatus = false;
   }
 }
 
