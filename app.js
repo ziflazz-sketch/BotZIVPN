@@ -116,7 +116,7 @@ if (vars.PAYMENT === "GOPAY" && !GOPAY_KEY) {
   throw new Error('GOPAY_KEY wajib diisi untuk payment GOPAY');
 }
 
-const DEFAULT_REQUEST_TIMEOUT = 8000;
+const DEFAULT_REQUEST_TIMEOUT = 20000;
 const PAYMENT_REQUEST_TIMEOUT = 10000;
 const sharedHttpAgent = new http.Agent({ keepAlive: true, timeout: DEFAULT_REQUEST_TIMEOUT });
 const sharedHttpsAgent = new https.Agent({ keepAlive: true, timeout: PAYMENT_REQUEST_TIMEOUT });
