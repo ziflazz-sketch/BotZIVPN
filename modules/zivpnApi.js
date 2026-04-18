@@ -4,7 +4,7 @@ const https = require('https');
 const sqlite3 = require('sqlite3').verbose();
 
 const db = new sqlite3.Database('./sellzivpn.db');
-const REQUEST_TIMEOUT = 8000;
+const REQUEST_TIMEOUT = 20000;
 const apiClient = axios.create({
   timeout: REQUEST_TIMEOUT,
   httpAgent: new http.Agent({ keepAlive: true, timeout: REQUEST_TIMEOUT }),
