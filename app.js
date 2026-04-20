@@ -378,6 +378,332 @@ async function getGlobalAccountStats() {
   });
 }
 
+
+function formatRupiah(amount) {
+  return Number(amount || 0).toLocaleString('id-ID');
+}
+
+function formatDurationDaysLabel(days) {
+  const numericDays = Number(days) || 0;
+  return `${numericDays} hari`;
+}
+
+function formatDateTimeJakarta(timestamp) {
+  const value = Number(timestamp) || 0;
+  if (!value) return '-';
+  return new Date(value).toLocaleString('id-ID', {
+    timeZone: 'Asia/Jakarta',
+    day: '2-digit',
+    month: 'long',
+    year: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit'
+  }).replace('.', ':');
+}
+
+function formatRemainingDuration(ms) {
+  const remainingMs = Math.max(0, Number(ms) || 0);
+  const totalMinutes = Math.floor(remainingMs / 60000);
+  const days = Math.floor(totalMinutes / (24 * 60));
+  const hours = Math.floor((totalMinutes % (24 * 60)) / 60);
+  const minutes = totalMinutes % 60;
+
+  if (days > 0) return `${days}h ${hours}j`;
+  if (hours > 0) return `${hours}j ${minutes}m`;
+  return `${minutes} menit`;
+}
+
+async function getActiveAccountsForUser(userId) {
+  const now = Date.now();
+  const rows = await dbAllAsync(
+    `SELECT
+       ap.account_key,
+       ap.account_type,
+       ap.server_id,
+       MAX(ap.expired_at) AS expired_at,
+       SUM(CASE WHEN ap.purchase_type = 'renew' THEN 1 ELSE 0 END) AS renew_count,
+       MAX(CASE WHEN ap.is_trial = 1 THEN 1 ELSE 0 END) AS is_trial,
+       s.nama_server,
+       s.domain
+     FROM account_purchases ap
+     LEFT JOIN Server s ON s.id = ap.server_id
+     WHERE ap.user_id = ?
+       AND ap.is_deleted = 0
+       AND ap.expired_at > ?
+     GROUP BY ap.account_key, ap.account_type, ap.server_id
+     ORDER BY expired_at ASC, ap.id ASC`,
+    [userId, now]
+  );
+
+  return rows.map((row) => {
+    const expiredAt = Number(row.expired_at || 0);
+    return {
+      accountKey: row.account_key,
+      accountType: row.account_type,
+      serverId: row.server_id,
+      expiredAt,
+      remainingMs: Math.max(0, expiredAt - now),
+      renewCount: Number(row.renew_count || 0),
+      isTrial: Number(row.is_trial || 0) === 1,
+      serverName: row.nama_server || `Server ${row.server_id}`,
+      domain: row.domain || '-'
+    };
+  });
+}
+
+async function sendMyAccountsMenu(ctx, page = 0) {
+  const accounts = await getActiveAccountsForUser(ctx.from.id).catch((error) => {
+    logger.error(`Gagal memuat akun aktif user ${ctx.from.id}: ${error.message}`);
+    return null;
+  });
+
+  if (!accounts) {
+    return ctx.reply('❌ Gagal memuat daftar akun aktif. Coba lagi nanti.');
+  }
+
+  if (!accounts.length) {
+    const emptyText = `📂 <b>AKUN SAYA</b>\n\nBelum ada akun aktif yang tersimpan saat ini.\n\nℹ️ Akun yang sudah expired atau sudah dihapus tidak akan ditampilkan di sini.`;
+    const emptyKeyboard = { inline_keyboard: [[{ text: '🔙 Menu Utama', callback_data: 'send_main_menu' }]] };
+    if (ctx.updateType === 'callback_query') {
+      try {
+        await ctx.editMessageText(emptyText, { parse_mode: 'HTML', reply_markup: emptyKeyboard });
+      } catch (error) {
+        await ctx.reply(emptyText, { parse_mode: 'HTML', reply_markup: emptyKeyboard });
+      }
+    } else {
+      await ctx.reply(emptyText, { parse_mode: 'HTML', reply_markup: emptyKeyboard });
+    }
+    return;
+  }
+
+  const pageSize = 5;
+  const totalPages = Math.max(1, Math.ceil(accounts.length / pageSize));
+  const safePage = Math.max(0, Math.min(page, totalPages - 1));
+  const start = safePage * pageSize;
+  const pageItems = accounts.slice(start, start + pageSize);
+
+  const lines = pageItems.map((account, index) => {
+    const nomor = start + index + 1;
+    const label = account.accountType.toUpperCase();
+    const badge = account.isTrial ? '🎁 Trial' : '✅ Premium';
+    const renewText = account.renewCount > 0 ? `\n🔄 <b>Renew:</b> ${account.renewCount}x` : '';
+    return `${nomor}. <b>${label}</b> • ${badge}\n` +
+      `🌐 <b>Server:</b> ${account.serverName}\n` +
+      `🔗 <b>Host:</b> <code>${account.domain}</code>\n` +
+      `🔑 <b>Password:</b> <code>${account.accountKey}</code>\n` +
+      `📅 <b>Expire:</b> ${formatDateTimeJakarta(account.expiredAt)}\n` +
+      `⏳ <b>Sisa:</b> ${formatRemainingDuration(account.remainingMs)}${renewText}`;
+  });
+
+  const textBody =
+    `📂 <b>AKUN SAYA</b>\n\n` +
+    `Menampilkan akun yang masih aktif.\n` +
+    `Akun expired atau yang sudah dihapus tidak akan ditampilkan.\n\n` +
+    `${lines.join('\n\n━━━━━━━━━━━━━━━━━━━━\n\n')}\n\n` +
+    `📊 <b>Total akun aktif:</b> ${accounts.length}`;
+
+  const navRow = [];
+  if (safePage > 0) navRow.push({ text: '⬅️ Sebelumnya', callback_data: `my_accounts_${safePage - 1}` });
+  if (safePage < totalPages - 1) navRow.push({ text: '➡️ Berikutnya', callback_data: `my_accounts_${safePage + 1}` });
+  const keyboard = [];
+  if (navRow.length) keyboard.push(navRow);
+  keyboard.push([{ text: '🔄 Refresh', callback_data: `my_accounts_${safePage}` }]);
+  keyboard.push([{ text: '🔙 Menu Utama', callback_data: 'send_main_menu' }]);
+
+  if (ctx.updateType === 'callback_query') {
+    try {
+      await ctx.editMessageText(textBody, { parse_mode: 'HTML', reply_markup: { inline_keyboard: keyboard } });
+    } catch (error) {
+      if (error?.response?.description?.includes('message is not modified')) {
+        await ctx.answerCbQuery('Daftar akun sudah terbaru.');
+      } else {
+        await ctx.reply(textBody, { parse_mode: 'HTML', reply_markup: { inline_keyboard: keyboard } });
+      }
+    }
+  } else {
+    await ctx.reply(textBody, { parse_mode: 'HTML', reply_markup: { inline_keyboard: keyboard } });
+  }
+}
+
+async function safeSendGroupMessage(html) {
+  if (!GROUP_ID) return false;
+  try {
+    await bot.telegram.sendMessage(GROUP_ID, html, { parse_mode: 'HTML' });
+    return true;
+  } catch (error) {
+    logger.warn(`Notifikasi grup gagal dikirim: ${error.message}`);
+    return false;
+  }
+}
+
+async function getLatestAccountSegmentExpiry(userId, serverId, accountKey, accountType) {
+  const row = await dbGetAsync(
+    `SELECT MAX(expired_at) AS max_expired
+       FROM account_purchases
+      WHERE user_id = ?
+        AND server_id = ?
+        AND account_key = ?
+        AND account_type = ?
+        AND is_refunded = 0`,
+    [userId, serverId, accountKey, accountType]
+  ).catch(() => null);
+
+  return Number(row?.max_expired || 0);
+}
+
+async function recordAccountPurchase({
+  userId,
+  serverId,
+  accountKey,
+  accountType,
+  purchaseType,
+  amountPaid,
+  durationDays,
+  isTrial = 0,
+}) {
+  const now = Date.now();
+  const durationMs = Math.max(0, Number(durationDays) || 0) * 24 * 60 * 60 * 1000;
+  let effectiveStartAt = now;
+
+  if (purchaseType === 'renew') {
+    const latestExpiry = await getLatestAccountSegmentExpiry(userId, serverId, accountKey, accountType);
+    if (latestExpiry > effectiveStartAt) {
+      effectiveStartAt = latestExpiry;
+    }
+  }
+
+  const expiredAt = effectiveStartAt + durationMs;
+
+  await dbRun(
+    `INSERT INTO account_purchases (
+      user_id, server_id, account_key, account_type, purchase_type,
+      amount_paid, duration_days, created_at, effective_start_at, expired_at,
+      is_trial, is_refunded, refund_amount
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0)`,
+    [
+      userId,
+      serverId,
+      accountKey,
+      accountType,
+      purchaseType,
+      Number(amountPaid) || 0,
+      Number(durationDays) || 0,
+      now,
+      effectiveStartAt,
+      expiredAt,
+      isTrial ? 1 : 0,
+    ]
+  );
+
+  return { effectiveStartAt, expiredAt };
+}
+
+async function applyProratedRefund({ userId, serverId, accountKey, accountType }) {
+  const now = Date.now();
+  const purchases = await dbAllAsync(
+    `SELECT id, amount_paid, duration_days, effective_start_at, expired_at
+       FROM account_purchases
+      WHERE user_id = ?
+        AND server_id = ?
+        AND account_key = ?
+        AND account_type = ?
+        AND is_trial = 0
+        AND is_refunded = 0
+      ORDER BY effective_start_at ASC, id ASC`,
+    [userId, serverId, accountKey, accountType]
+  );
+
+  if (!purchases.length) {
+    return {
+      refundTotal: 0,
+      refundableSegments: 0,
+      latestExpiredAt: 0,
+      latestRemainingDays: 0,
+      alreadyExpiredSegments: 0,
+      purchases: []
+    };
+  }
+
+  let refundTotal = 0;
+  let refundableSegments = 0;
+  let alreadyExpiredSegments = 0;
+  let latestExpiredAt = 0;
+  let latestRemainingDays = 0;
+  const updates = [];
+
+  for (const row of purchases) {
+    const startAt = Number(row.effective_start_at || now);
+    const expiredAt = Number(row.expired_at || startAt);
+    const totalMs = Math.max(0, expiredAt - startAt);
+    const remainingMs = Math.max(0, expiredAt - now);
+    const refundAmount = totalMs > 0
+      ? Math.floor((Number(row.amount_paid || 0) * remainingMs) / totalMs)
+      : 0;
+
+    if (expiredAt > latestExpiredAt) {
+      latestExpiredAt = expiredAt;
+      latestRemainingDays = remainingMs > 0 ? remainingMs / (24 * 60 * 60 * 1000) : 0;
+    }
+
+    if (refundAmount > 0) {
+      refundableSegments += 1;
+      refundTotal += refundAmount;
+    } else {
+      alreadyExpiredSegments += 1;
+    }
+
+    updates.push({ purchaseId: row.id, refundAmount });
+  }
+
+  await dbRun('BEGIN IMMEDIATE TRANSACTION');
+  try {
+    if (refundTotal > 0) {
+      await dbRun('UPDATE users SET saldo = saldo + ? WHERE user_id = ?', [refundTotal, userId]);
+    }
+
+    for (const item of updates) {
+      await dbRun(
+        `UPDATE account_purchases
+            SET is_refunded = 1,
+                refund_amount = ?,
+                refunded_at = ?,
+                is_deleted = 1,
+                deleted_at = ?
+          WHERE id = ?`,
+        [item.refundAmount, now, now, item.purchaseId]
+      );
+    }
+
+    if (refundTotal > 0) {
+      await dbRun(
+        `INSERT INTO transactions (user_id, amount, type, reference_id, timestamp)
+         VALUES (?, ?, ?, ?, ?)`,
+        [
+          userId,
+          refundTotal,
+          `refund_delete_${accountType}`,
+          `refund-${accountType}-${userId}-${serverId}-${accountKey}-${now}`,
+          now,
+        ]
+      );
+    }
+
+    await dbRun('COMMIT');
+  } catch (error) {
+    await dbRun('ROLLBACK').catch(() => {});
+    throw error;
+  }
+
+  return {
+    refundTotal,
+    refundableSegments,
+    latestExpiredAt,
+    latestRemainingDays,
+    alreadyExpiredSegments,
+    purchases
+  };
+}
+
 async function ensureColumnExists(tableName, columnName, columnDefinition) {
   const columns = await dbAllAsync(`PRAGMA table_info(${tableName})`);
   if (columns.some((column) => column.name === columnName)) return false;
@@ -401,7 +727,10 @@ async function optimizeDatabase() {
   await dbRun('CREATE INDEX IF NOT EXISTS idx_transactions_user_timestamp ON transactions(user_id, timestamp)');
   await dbRun('CREATE INDEX IF NOT EXISTS idx_transactions_type_timestamp ON transactions(type, timestamp)');
   await dbRun('CREATE INDEX IF NOT EXISTS idx_server_name ON Server(nama_server)');
+  await dbRun('CREATE INDEX IF NOT EXISTS idx_account_purchases_lookup ON account_purchases(user_id, server_id, account_key, account_type, is_refunded)');
+  await dbRun('CREATE INDEX IF NOT EXISTS idx_account_purchases_expiry ON account_purchases(expired_at)');
 }
+
 
 async function initializeDatabase() {
   await dbRun(`CREATE TABLE IF NOT EXISTS Server (
@@ -458,6 +787,35 @@ async function initializeDatabase() {
   )`);
 
   await dbRun(`INSERT OR IGNORE INTO app_settings (key, value) VALUES ('topup_bonus_percent', '0')`);
+
+  await dbRun(`CREATE TABLE IF NOT EXISTS account_purchases (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    server_id INTEGER NOT NULL,
+    account_key TEXT NOT NULL,
+    account_type TEXT NOT NULL,
+    purchase_type TEXT NOT NULL,
+    amount_paid INTEGER NOT NULL DEFAULT 0,
+    duration_days INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL,
+    effective_start_at INTEGER NOT NULL DEFAULT 0,
+    expired_at INTEGER NOT NULL DEFAULT 0,
+    is_trial INTEGER NOT NULL DEFAULT 0,
+    is_refunded INTEGER NOT NULL DEFAULT 0,
+    refund_amount INTEGER NOT NULL DEFAULT 0,
+    refunded_at INTEGER,
+    is_deleted INTEGER NOT NULL DEFAULT 0,
+    deleted_at INTEGER
+  )`);
+
+  await ensureColumnExists('account_purchases', 'effective_start_at', 'effective_start_at INTEGER NOT NULL DEFAULT 0').catch(() => false);
+  await ensureColumnExists('account_purchases', 'expired_at', 'expired_at INTEGER NOT NULL DEFAULT 0').catch(() => false);
+  await ensureColumnExists('account_purchases', 'is_trial', 'is_trial INTEGER NOT NULL DEFAULT 0').catch(() => false);
+  await ensureColumnExists('account_purchases', 'is_refunded', 'is_refunded INTEGER NOT NULL DEFAULT 0').catch(() => false);
+  await ensureColumnExists('account_purchases', 'refund_amount', 'refund_amount INTEGER NOT NULL DEFAULT 0').catch(() => false);
+  await ensureColumnExists('account_purchases', 'refunded_at', 'refunded_at INTEGER').catch(() => false);
+  await ensureColumnExists('account_purchases', 'is_deleted', 'is_deleted INTEGER NOT NULL DEFAULT 0').catch(() => false);
+  await ensureColumnExists('account_purchases', 'deleted_at', 'deleted_at INTEGER').catch(() => false);
 
   await optimizeDatabase();
 
@@ -683,6 +1041,9 @@ Status: <code>${statusReseller}</code>
     [
       { text: '⌛ Trial Akun', callback_data: 'service_trial' },
       { text: '💰 TopUp Saldo', callback_data: 'topup_saldo' }
+    ],
+    [
+      { text: '📂 Akun Saya', callback_data: 'my_accounts_0' }
     ],
     [
       { text: '🤝 Jadi Reseller & Dapat Harga Spesial', callback_data: 'jadi_reseller' }
@@ -2170,9 +2531,7 @@ logger.info(`✅ Trial ${type} dibuat oleh ${ctx.from.id}`);
 const maskedUsername = username.length > 1 
   ? `${username.slice(0, 1)}${'x'.repeat(username.length - 1)}` 
   : username; // Kalau kurang dari 3 char, tampilkan tanpa masking
-await bot.telegram.sendMessage(
-  GROUP_ID,
-  `<blockquote>
+await safeSendGroupMessage(`<blockquote>
 ⌛ <b>Trial Account Created</b>
 ━━━━━━━━━━━━━━━━━━━━
 👤 <b>User:</b> ${ctx.from.first_name} (${ctx.from.id})
@@ -2182,9 +2541,7 @@ await bot.telegram.sendMessage(
 💾 <b>Quota:</b> ${quota1 || '-'}
 🌐 <b>Server ID:</b> ${serverId}
 ━━━━━━━━━━━━━━━━━━━━
-</blockquote>`,
-  { parse_mode: 'HTML' }
-       );
+</blockquote>`);
 
     const trialFunctions = {
       ssh: trialssh
@@ -2210,8 +2567,19 @@ bot.action(/(del)_username_(ssh)_(.+)/, async (ctx) => {
     step: `username_${action}_${type}`,
     serverId, type, action
   };
-  await ctx.reply('👤 *Masukkan Password yang ingin dihapus:*', { parse_mode: 'Markdown' });
+  await ctx.reply('👤 *Masukkan password akun yang ingin dihapus:*', { parse_mode: 'Markdown' });
 });
+
+bot.action(/my_accounts_(\d+)/, async (ctx) => {
+  const page = Number(ctx.match[1] || 0);
+  try {
+    await sendMyAccountsMenu(ctx, page);
+  } catch (error) {
+    logger.error(`Gagal membuka menu akun saya: ${error.message}`);
+    await ctx.reply('❌ Gagal membuka daftar akun aktif. Coba lagi nanti.');
+  }
+});
+
 
 bot.on('text', async (ctx) => {
   const state = userState[ctx.chat.id];
@@ -2240,15 +2608,14 @@ bot.on('text', async (ctx) => {
 // DELETE USERNAME
 //
   if (state.step?.startsWith('username_del_')) {
-    const username = text;
-    // Validasi username (hanya huruf kecil dan angka, 3-20 karakter)
-   if (!/^[a-zA-Z0-9]{3,20}$/.test(username)) {
-  return ctx.reply(
-    '❌ *Username tidak valid. Gunakan huruf (A–Z / a–z) dan angka (3–20 karakter).*',
-    { parse_mode: 'Markdown' }
-  );
-}
-       //izin ressel saja
+    const accountKey = text;
+    if (!/^[a-zA-Z0-9]{3,20}$/.test(accountKey)) {
+      return ctx.reply(
+        '❌ *Password akun tidak valid. Gunakan huruf dan angka (3–20 karakter).*',
+        { parse_mode: 'Markdown' }
+      );
+    }
+
     const resselDbPath = './ressel.db';
     fs.readFile(resselDbPath, 'utf8', async (err, data) => {
       if (err) {
@@ -2258,39 +2625,69 @@ bot.on('text', async (ctx) => {
 
       const idUser = ctx.from.id.toString().trim();
       const resselList = data.split('\n').map(line => line.trim()).filter(Boolean);
-
-      console.log('🧪 ID Pengguna:', idUser);
-      console.log('📂 Daftar Ressel:', resselList);
-
       const isRessel = resselList.includes(idUser);
 
       if (!isRessel) {
         return ctx.reply('❌ *Fitur ini hanya untuk Ressel VPN.*', { parse_mode: 'Markdown' });
       }
-  //izin ressel saja
-    const { type, serverId } = state;
-    delete userState[ctx.chat.id];
 
-    let msg = 'none';
-    try {
-      const password = 'none', exp = 'none', iplimit = 'none';
+      const { type, serverId } = state;
+      delete userState[ctx.chat.id];
 
-      const delFunctions = {
-        ssh: delssh
-      };
+      try {
+        const password = 'none', exp = 'none', iplimit = 'none';
+        const delFunctions = { ssh: delssh };
+        const func = delFunctions[type];
+        if (!func) {
+          return ctx.reply('❌ *Fitur hapus akun untuk layanan ini belum tersedia.*', { parse_mode: 'Markdown' });
+        }
 
-      if (delFunctions[type]) {
-        msg = await delFunctions[type](username, password, exp, iplimit, serverId);
-        //await recordAccountTransaction(ctx.from.id, type);
+        let msg = await func(accountKey, password, exp, iplimit, serverId);
+        if (msg.includes('❌')) {
+          return ctx.reply(msg, { parse_mode: 'Markdown' });
+        }
+
+        let refundInfo = null;
+        try {
+          refundInfo = await applyProratedRefund({
+            userId: ctx.from.id,
+            serverId,
+            accountKey,
+            accountType: type,
+          });
+        } catch (refundError) {
+          logger.error(`❌ Gagal menghitung refund otomatis: ${refundError.message}`);
+          refundInfo = { refundTotal: 0, refundableSegments: 0, latestRemainingDays: 0, purchases: [] };
+        }
+
+        if (refundInfo?.refundTotal > 0) {
+          msg += `
+
+💸 *AUTO REFUND BERHASIL*
+` +
+            `• Refund masuk: \`Rp${formatRupiah(refundInfo.refundTotal)}\`
+` +
+            `• Sisa masa aktif: \`${refundInfo.latestRemainingDays.toFixed(1)} hari\`
+` +
+            `• Segment aktif: \`${refundInfo.refundableSegments}\``;
+        } else {
+          msg += `
+
+ℹ️ *Refund otomatis tidak tersedia*
+` +
+            `• Akun ini belum punya riwayat pembelian baru
+` +
+            `  atau masa aktifnya sudah habis.`;
+        }
+
+        await ctx.reply(msg, { parse_mode: 'Markdown' });
+        logger.info(`✅ Akun ${type} berhasil dihapus oleh ${ctx.from.id}. Refund: Rp${refundInfo?.refundTotal || 0}`);
+      } catch (err) {
+        logger.error('❌ Gagal hapus akun:', err.message);
+        await ctx.reply('❌ *Terjadi kesalahan saat menghapus akun.*', { parse_mode: 'Markdown' });
       }
-
-      await ctx.reply(msg, { parse_mode: 'Markdown' });
-      logger.info(`✅ Akun ${type} berhasil dihapus oleh ${ctx.from.id}`);
-    } catch (err) {
-      logger.error('❌ Gagal hapus akun:', err.message);
-      await ctx.reply('❌ *Terjadi kesalahan saat menghapus akun.*', { parse_mode: 'Markdown' });
-    }});
-    return; // Penting! Jangan lanjut ke case lain
+    });
+    return;
   }
 if (state.step?.startsWith('password_')) {
   state.password = ctx.message.text.trim();
@@ -2360,20 +2757,17 @@ if (exp > 365) {
           if (saldo < totalHarga) {
             return ctx.reply('❌ *Saldo Anda tidak mencukupi untuk melakukan transaksi ini.*', { parse_mode: 'Markdown' });
           }
+          const maskedpassword = password.length > 1
+            ? `${password.slice(0, 1)}${'x'.repeat(password.length - 1)}`
+            : password;
+
           if (action === 'create') {
             if (type === 'ssh') {
               msg = await createssh(username, password, exp, iplimit, serverId);
               await recordAccountTransaction(ctx.from.id, 'ssh');
             }
             logger.info(`Account created and transaction recorded for user ${ctx.from.id}, type: ${type}`);
-const maskedpassword = password.length > 1 
-  ? `${password.slice(0, 1)}${'x'.repeat(password.length - 1)}` 
-  : password; // Kalau kurang dari 1 char, tampilkan tanpa masking
-
-// 🔔 Kirim notifikasi ke grup
-await bot.telegram.sendMessage(
-  GROUP_ID,
-  `<blockquote>
+            await safeSendGroupMessage(`<blockquote>
 📢 <b>Account Created</b>
 ━━━━━━━━━━━━━━━━━━━━
 👤 <b>User:</b> ${ctx.from.first_name} (${ctx.from.id})
@@ -2383,22 +2777,14 @@ await bot.telegram.sendMessage(
 💾 <b>Quota:</b> ${quota || '0'}
 🌐 <b>Server ID:</b> ${serverId}
 ━━━━━━━━━━━━━━━━━━━━
-</blockquote>`,
-  { parse_mode: 'HTML' }
-       );
+</blockquote>`);
           } else if (action === 'renew') {
             if (type === 'ssh') {
               msg = await renewssh(username, password, exp, iplimit, serverId);
               await recordAccountTransaction(ctx.from.id, 'ssh');
             }
             logger.info(`Account renewed and transaction recorded for user ${ctx.from.id}, type: ${type}`);
-const maskedpassword = password.length > 1 
-  ? `${password.slice(0, 1)}${'x'.repeat(password.length - 1)}` 
-  : password; // Kalau kurang dari 1 char, tampilkan tanpa masking
-// 🔔 Kirim notifikasi ke grup
-await bot.telegram.sendMessage(
-  GROUP_ID,
-  `<blockquote>
+            await safeSendGroupMessage(`<blockquote>
 ♻️ <b>Account Renewed</b>
 ━━━━━━━━━━━━━━━━━━━━
 👤 <b>User:</b> ${ctx.from.first_name} (${ctx.from.id})
@@ -2408,30 +2794,45 @@ await bot.telegram.sendMessage(
 💾 <b>Quota:</b> ${quota || '0'}
 🌐 <b>Server ID:</b> ${serverId}
 ━━━━━━━━━━━━━━━━━━━━
-</blockquote>`,
-  { parse_mode: 'HTML' }
-       );
-}
-//SALDO DATABES
-// setelah bikin akun (create/renew), kita cek hasilnya
-if (msg.includes('❌')) {
-  logger.error(`🔄 Rollback saldo user ${ctx.from.id}, type: ${type}, server: ${serverId}, respon: ${msg}`);
-  return ctx.reply(msg, { parse_mode: 'Markdown' });
-}
+</blockquote>`);
+          }
 
-// kalau sampai sini artinya tidak ada ❌, transaksi sukses
-logger.info(`✅ Transaksi sukses untuk user ${ctx.from.id}, type: ${type}, server: ${serverId}`);
+          if (msg.includes('❌')) {
+            logger.error(`🔄 Rollback saldo user ${ctx.from.id}, type: ${type}, server: ${serverId}, respon: ${msg}`);
+            return ctx.reply(msg, { parse_mode: 'Markdown' });
+          }
 
-db.run('UPDATE users SET saldo = saldo - ? WHERE user_id = ?', [totalHarga, ctx.from.id], (err) => {
-  if (err) {
-    logger.error('⚠️ Kesalahan saat mengurangi saldo pengguna:', err.message);
-    return ctx.reply('❌ *Terjadi kesalahan saat mengurangi saldo pengguna.*', { parse_mode: 'Markdown' });
-  }
-});
+          logger.info(`✅ Transaksi sukses untuk user ${ctx.from.id}, type: ${type}, server: ${serverId}`);
 
-await ctx.reply(`✅ *CREATE SSH ZIFLAZZ BERHASIL*\n\n${msg}`, { parse_mode: 'Markdown' });
-delete userState[ctx.chat.id];
-//SALDO DATABES
+          try {
+            await dbRun('BEGIN IMMEDIATE TRANSACTION');
+            await dbRun('UPDATE users SET saldo = saldo - ? WHERE user_id = ?', [totalHarga, ctx.from.id]);
+
+            if ((action === 'create' || action === 'renew') && type === 'ssh') {
+              await recordAccountPurchase({
+                userId: ctx.from.id,
+                serverId,
+                accountKey: password,
+                accountType: type,
+                purchaseType: action,
+                amountPaid: totalHarga,
+                durationDays: exp,
+                isTrial: 0,
+              });
+            }
+
+            await dbRun('COMMIT');
+          } catch (trxError) {
+            await dbRun('ROLLBACK').catch(() => {});
+            logger.error(`❌ Gagal menyimpan transaksi akun ${action}: ${trxError.message}`);
+            return ctx.reply('❌ *Transaksi berhasil di server, tetapi gagal disimpan di bot. Hubungi admin.*', { parse_mode: 'Markdown' });
+          }
+
+          const successTitle = action === 'renew'
+            ? '✅ *RENEW SSH ZIFLAZZ BERHASIL*'
+            : '✅ *CREATE SSH ZIFLAZZ BERHASIL*';
+          await ctx.reply(`${successTitle}\n\n${msg}`, { parse_mode: 'Markdown' });
+          delete userState[ctx.chat.id];
           });
         });
     } 
