@@ -8,7 +8,7 @@ const {
 
 async function delssh(username, password, exp, iplimit, serverId) {
   if (!/^[a-zA-Z0-9-]+$/.test(username)) {
-    return '❌ Username tidak valid. Gunakan huruf, angka, dan strip (-).';
+    return '❌ Password akun tidak valid. Gunakan huruf, angka, dan strip (-).';
   }
 
   try {
@@ -29,7 +29,7 @@ async function delssh(username, password, exp, iplimit, serverId) {
     return `✅ *AKUN BERHASIL DIHAPUS*
 
 ━━━━━━━━━━━━━━━━━━━━
-👤  *Username* : \`${username}\`
+🔑  *Password* : \`${username}\`
 🌐  *Host*     : \`${details.host}\`
 ━━━━━━━━━━━━━━━━━━━━
 🗑️ _Akun berhasil dihapus dari server._
