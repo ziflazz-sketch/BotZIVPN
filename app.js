@@ -1112,17 +1112,19 @@ const helpMessage = `
 8. /delressel - Menghapus ID reseller.
 9. /listressel - Menampilkan daftar reseller.
 10. /broadcast - Mengirim pesan siaran ke semua pengguna.
-11. /broadcastfoto - Mengirim foto siaran ke semua pengguna.
-12. /editharga - Mengedit harga layanan.
-13. /editauth - Mengedit auth server.
-14. /editdomain - Mengedit domain server.
-15. /editlimitcreate - Mengedit batas pembuatan akun server.
-16. /editlimitip - Mengedit batas IP server.
-17. /editlimitquota - Mengedit batas quota server.
-18. /editnama - Mengedit nama server.
-19. /edittotalcreate - Mengedit total pembuatan akun server.
-20. /hapuslog - Menghapus log bot.
-21. /backup - Menjalankan backup otomatis.
+11. /broadcast_resseller - Mengirim pesan siaran khusus ke reseller terdaftar.
+12. /broadcastfoto - Mengirim foto siaran ke semua pengguna.
+13. /broadcastfoto_resseller - Mengirim foto atau foto+teks khusus ke reseller.
+14. /editharga - Mengedit harga layanan.
+15. /editauth - Mengedit auth server.
+16. /editdomain - Mengedit domain server.
+17. /editlimitcreate - Mengedit batas pembuatan akun server.
+18. /editlimitip - Mengedit batas IP server.
+19. /editlimitquota - Mengedit batas quota server.
+20. /editnama - Mengedit nama server.
+21. /edittotalcreate - Mengedit total pembuatan akun server.
+22. /hapuslog - Menghapus log bot.
+23. /backup - Menjalankan backup otomatis.
 
 *Format cepat saldo:*
 - /setsaldo <user_id> <jumlah>
@@ -1189,6 +1191,76 @@ bot.command('broadcast', async (ctx) => {
       { parse_mode: 'Markdown' }
     );
   });
+});
+
+
+bot.command('broadcast_resseller', async (ctx) => {
+  const userId = ctx.message.from.id;
+  if (!adminIds.includes(userId)) {
+    return ctx.reply('⛔ Anda tidak punya izin.');
+  }
+
+  const replyMessage = ctx.message.reply_to_message;
+  const msg = replyMessage?.text || ctx.message.text.split(' ').slice(1).join(' ').trim();
+
+  if (!msg) {
+    return ctx.reply('⚠️ Harap isi pesan khusus reseller.\nGunakan: `/broadcast_resseller pesan`\nAtau reply pesan lalu kirim `/broadcast_resseller`', { parse_mode: 'Markdown' });
+  }
+
+  let resellerIds = [];
+  try {
+    resellerIds = [...new Set(listResellersSync().map(id => String(id).trim()).filter(Boolean))];
+  } catch (error) {
+    logger.error('❌ Gagal membaca daftar reseller untuk broadcast: ' + error.message);
+    return ctx.reply('⚠️ Gagal membaca daftar reseller.');
+  }
+
+  if (resellerIds.length === 0) {
+    return ctx.reply('⚠️ Tidak ada reseller terdaftar di `ressel.db`.', { parse_mode: 'Markdown' });
+  }
+
+  await ctx.reply(`📣 Broadcast reseller dimulai ke *${resellerIds.length}* reseller...`, { parse_mode: 'Markdown' });
+
+  let sukses = 0;
+  let gagal = 0;
+  let invalid = 0;
+  const delay = 35;
+
+  for (const resellerId of resellerIds) {
+    try {
+      await axios.post(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+        chat_id: resellerId,
+        text: msg
+      });
+      sukses++;
+    } catch (error) {
+      const code = error.response?.status;
+      gagal++;
+
+      if (code === 400 || code === 403) {
+        invalid++;
+        console.log(`🚫 Reseller invalid/blocked (tidak dihapus): ${resellerId}`);
+      }
+
+      console.log(`❌ Gagal kirim broadcast reseller ke ${resellerId}: ${code || error.message}`);
+    }
+
+    await new Promise(r => setTimeout(r, delay));
+  }
+
+  return ctx.reply(
+    `📣 *Broadcast reseller selesai!*
+
+` +
+    `👥 Target reseller: *${resellerIds.length}*
+` +
+    `✔️ Berhasil: *${sukses}*
+` +
+    `❌ Gagal: *${gagal}*
+` +
+    `🚫 Invalid/Blocked: *${invalid}*`,
+    { parse_mode: 'Markdown' }
+  );
 });
 
 bot.command('broadcastfoto', async (ctx) => {
@@ -1270,6 +1342,93 @@ bot.command('broadcastfoto', async (ctx) => {
       { parse_mode: 'Markdown' }
     );
   });
+});
+
+bot.command('broadcastfoto_resseller', async (ctx) => {
+  const userId = ctx.message.from.id;
+  if (!adminIds.includes(userId)) {
+    return ctx.reply('⛔ Anda tidak punya izin.');
+  }
+
+  const replyMsg = ctx.message.reply_to_message;
+
+  let isPhoto = false;
+  let msgText = '';
+  let photoFileId = '';
+
+  if (replyMsg) {
+    if (replyMsg.photo) {
+      isPhoto = true;
+      photoFileId = replyMsg.photo[replyMsg.photo.length - 1].file_id;
+      msgText = replyMsg.caption || '';
+    } else if (replyMsg.text) {
+      msgText = replyMsg.text;
+    }
+  } else {
+    msgText = ctx.message.text.split(' ').slice(1).join(' ').trim();
+  }
+
+  if (!msgText && !photoFileId) {
+    return ctx.reply('⚠️ Harap reply foto reseller, foto+caption, atau isi teks.\nGunakan: `/broadcastfoto_resseller teks`\nAtau reply foto lalu kirim `/broadcastfoto_resseller`', { parse_mode: 'Markdown' });
+  }
+
+  let resellerIds = [];
+  try {
+    resellerIds = [...new Set(listResellersSync().map(id => String(id).trim()).filter(Boolean))];
+  } catch (error) {
+    logger.error('❌ Gagal membaca daftar reseller untuk broadcast foto: ' + error.message);
+    return ctx.reply('⚠️ Gagal membaca daftar reseller.');
+  }
+
+  if (resellerIds.length === 0) {
+    return ctx.reply('⚠️ Tidak ada reseller terdaftar di `ressel.db`.', { parse_mode: 'Markdown' });
+  }
+
+  await ctx.reply(`🖼️ Broadcast foto reseller dimulai ke *${resellerIds.length}* reseller...`, { parse_mode: 'Markdown' });
+
+  let sukses = 0;
+  let gagal = 0;
+  let invalid = 0;
+  const delay = 35;
+
+  for (const resellerId of resellerIds) {
+    try {
+      if (isPhoto) {
+        await axios.post(`https://api.telegram.org/bot${BOT_TOKEN}/sendPhoto`, {
+          chat_id: resellerId,
+          photo: photoFileId,
+          caption: msgText
+        });
+      } else {
+        await axios.post(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+          chat_id: resellerId,
+          text: msgText
+        });
+      }
+      sukses++;
+    } catch (error) {
+      const code = error.response?.status;
+      gagal++;
+
+      if (code === 400 || code === 403) {
+        invalid++;
+        console.log(`🚫 Reseller invalid/blocked (tidak dihapus): ${resellerId}`);
+      }
+
+      console.log(`❌ Gagal kirim broadcast foto reseller ke ${resellerId}: ${code || error.message}`);
+    }
+
+    await new Promise(r => setTimeout(r, delay));
+  }
+
+  return ctx.reply(
+    `🖼️ *Broadcast foto reseller selesai!*\n\n` +
+    `👥 Target reseller: *${resellerIds.length}*\n` +
+    `✔️ Berhasil: *${sukses}*\n` +
+    `❌ Gagal: *${gagal}*\n` +
+    `🚫 Invalid/Blocked: *${invalid}*`,
+    { parse_mode: 'Markdown' }
+  );
 });
 
 bot.command('addsaldo', async (ctx) => {
