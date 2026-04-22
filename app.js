@@ -1122,7 +1122,7 @@ const helpMessage = `
 18. /editnama - Mengedit nama server.
 19. /edittotalcreate - Mengedit total pembuatan akun server.
 20. /hapuslog - Menghapus log bot.
-21. /backup - Menjalankan backup otomatis.
+21. /backup - Mengirim arsip backup terbaru (snapshot SQLite).
 
 *Format cepat saldo:*
 - /setsaldo <user_id> <jumlah>
@@ -1841,11 +1841,11 @@ bot.command('backup', async (ctx) => {
     }
 
     // konfirmasi start
-    await ctx.reply('⚙️ Menjalankan backup... Mohon tunggu sebentar.');
+    await ctx.reply('⚙️ Menjalankan backup terbaru... Bot sedang membuat snapshot data saat ini.');
 
     // jalankan script backup (jangan lewatkan path lengkap)
     // beri timeout 60s, dan buffer besar agar output panjang tercover
-    exec('/usr/bin/backup_sellzivpn', { timeout: 60 * 1000, maxBuffer: 5 * 1024 * 1024 }, (err, stdout, stderr) => {
+    exec('/usr/bin/backup_sellzivpn', { timeout: 120 * 1000, maxBuffer: 8 * 1024 * 1024 }, (err, stdout, stderr) => {
       if (err) {
         console.error('❌ Error menjalankan backup:', err);
         // kirim pesan error ringkas ke admin (jangan kirim stacktrace panjang)

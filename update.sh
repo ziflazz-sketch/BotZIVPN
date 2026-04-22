@@ -14,7 +14,7 @@ sudo apt autoremove -y
     if [ ! -f /root/BotZiVPN/app.js ]; then
         git clone https://github.com/ziflazz-sketch/BotZIVPN.git /root/BotZiVPN
     fi
-apt install jq -y
+apt install jq sqlite3 zip -y
 apt install npm pm2 -y
 npm install -g npm@latest
 npm install -g pm2
@@ -61,43 +61,81 @@ pm2 save
 
 cat >/usr/bin/backup_sellzivpn <<'EOF'
 #!/bin/bash
-# File: /usr/bin/backup_sellzivpn
-# Pastikan chmod +x /usr/bin/backup_sellzivpn
+set -euo pipefail
 
 VARS_FILE="/root/BotZiVPN/.vars.json"
 DB_FOLDER="/root/BotZiVPN"
+TMP_DIR=$(mktemp -d /tmp/backup_sellzivpn.XXXXXX)
+TS=$(date +%F-%H%M%S)
+ARCHIVE_NAME="backup-sellzivpn-$TS.zip"
+ARCHIVE_PATH="$TMP_DIR/$ARCHIVE_NAME"
 
-# Cek file .vars.json
+cleanup() {
+  rm -rf "$TMP_DIR"
+}
+trap cleanup EXIT
+
 if [ ! -f "$VARS_FILE" ]; then
-    echo "❌ File $VARS_FILE tidak ditemukan"
-    exit 1
+  echo "❌ File $VARS_FILE tidak ditemukan"
+  exit 1
 fi
 
-# Ambil nilai dari .vars.json
-BOT_TOKEN=$(jq -r '.BOT_TOKEN' "$VARS_FILE")
-USER_ID=$(jq -r '.USER_ID' "$VARS_FILE")
+BOT_TOKEN=$(jq -r '.BOT_TOKEN // empty' "$VARS_FILE")
+USER_ID=$(jq -r '.USER_ID // empty' "$VARS_FILE")
 
 if [ -z "$BOT_TOKEN" ] || [ -z "$USER_ID" ]; then
-    echo "❌ BOT_TOKEN atau USER_ID kosong di $VARS_FILE"
-    exit 1
+  echo "❌ BOT_TOKEN atau USER_ID kosong di $VARS_FILE"
+  exit 1
 fi
 
-# Daftar file database
-DB_FILES=("sellzivpn.db" "trial.db" "ressel.db")
+command -v sqlite3 >/dev/null 2>&1 || { echo "❌ sqlite3 belum terinstall"; exit 1; }
+command -v zip >/dev/null 2>&1 || { echo "❌ zip belum terinstall"; exit 1; }
 
-for DB_FILE in "${DB_FILES[@]}"; do
-    FILE_PATH="$DB_FOLDER/$DB_FILE"
-    if [ -f "$FILE_PATH" ]; then
-        curl -s --connect-timeout 1 --max-time 3 -F chat_id="$USER_ID" \
-             -F document=@"$FILE_PATH" \
-             "https://api.telegram.org/bot$BOT_TOKEN/sendDocument" >/dev/null 2>&1
-        echo "✅ $DB_FILE terkirim ke Telegram"
-    else
-        echo "❌ File $DB_FILE tidak ditemukan"
-    fi
+if [ ! -f "$DB_FOLDER/sellzivpn.db" ]; then
+  echo "❌ File sellzivpn.db tidak ditemukan"
+  exit 1
+fi
+
+sqlite3 "$DB_FOLDER/sellzivpn.db" "PRAGMA wal_checkpoint(TRUNCATE);" >/dev/null 2>&1 || true
+sqlite3 "$DB_FOLDER/sellzivpn.db" ".backup '$TMP_DIR/sellzivpn.db'"
+sqlite3 "$TMP_DIR/sellzivpn.db" "PRAGMA integrity_check;" | grep -qx "ok" || {
+  echo "❌ Integrity check backup gagal"
+  exit 1
+}
+
+for FILE in trial.db ressel.db .vars.json; do
+  if [ -f "$DB_FOLDER/$FILE" ]; then
+    cp -f "$DB_FOLDER/$FILE" "$TMP_DIR/$FILE"
+  fi
 done
 
-echo "✅ Semua backup selesai."
+(
+  cd "$TMP_DIR"
+  zip -q "$ARCHIVE_PATH" sellzivpn.db trial.db ressel.db .vars.json 2>/dev/null || true
+)
+
+if [ ! -f "$ARCHIVE_PATH" ]; then
+  echo "❌ Gagal membuat arsip backup"
+  exit 1
+fi
+
+curl -s --connect-timeout 5 --max-time 120   -F chat_id="$USER_ID"   -F caption="📦 Backup terbaru ZIFLAZZ ($TS)"   -F document=@"$ARCHIVE_PATH"   "https://api.telegram.org/bot$BOT_TOKEN/sendDocument" >/dev/null 2>&1 || {
+    echo "❌ Gagal mengirim arsip backup ke Telegram"
+    exit 1
+  }
+
+USERS=$(sqlite3 "$TMP_DIR/sellzivpn.db" "SELECT COUNT(*) FROM users;" 2>/dev/null || echo 0)
+TX=$(sqlite3 "$TMP_DIR/sellzivpn.db" "SELECT COUNT(*) FROM transactions;" 2>/dev/null || echo 0)
+SERVERS=$(sqlite3 "$TMP_DIR/sellzivpn.db" "SELECT COUNT(*) FROM Server;" 2>/dev/null || echo 0)
+
+cat <<MSG
+✅ Backup terbaru berhasil dibuat dan dikirim.
+📦 Arsip: $ARCHIVE_NAME
+👥 Users: $USERS
+💳 Transactions: $TX
+🌐 Server: $SERVERS
+📁 File: sellzivpn.db, trial.db, ressel.db, .vars.json
+MSG
 EOF
 
 # bikin cron job tiap 1 jam
