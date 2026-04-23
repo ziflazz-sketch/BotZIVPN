@@ -4309,7 +4309,7 @@ async function processDeposit(ctx, amount) {
     const bonusAmount = getTopupBonusAmount(finalAmount, bonusPercent);
 
     const res = await paymentHttp.post(
-      "https://api-gopay.sawargipay.cloud/qris/generate",
+      "https://v1-gateway.autogopay.site/qris/generate",
       { amount: finalAmount },
       {
         headers: {
@@ -4447,7 +4447,7 @@ async function checkQRISStatus() {
         }
 
         const res = await paymentHttp.post(
-          "https://api-gopay.sawargipay.cloud/qris/status",
+          "https://v1-gateway.autogopay.site/qris/status",
           { transaction_id: deposit.transactionId },
           {
             headers: {
